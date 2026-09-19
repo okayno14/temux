@@ -1,0 +1,1015 @@
+#!/usr/bin/env escript
+
+-mode(compile).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("kernel/include/logger.hrl").
+
+%%%===================================================================
+%%% entry
+%%%===================================================================
+
+-spec main(Args :: [string()]) ->
+    ok
+    | sessions_list_ret()
+    | init_sessions_ret().
+
+main(Args) ->
+    ok = logger:set_primary_config(level, debug),
+    ok = logger:update_handler_config(default, level, debug),
+    ok = logger:update_formatter_config(
+        default,
+        template,
+        [
+            time, " ",
+            level, " ",
+            pid,
+            " [", "temux", ":", line, "]\: ", msg, "\n"
+        ]
+    ),
+    route(Args).
+
+%%%===================================================================
+%%% controller
+%%%===================================================================
+
+route(["test"]) ->
+    some_test();
+    %% Need to wait for whole log output (logger sends async logs)
+    % timer:sleep(1000);
+route(["help"]) ->
+    help();
+route(["help", "config"]) ->
+    help_config();
+route(["help", "configuration"]) ->
+    help_config();
+route([]) ->
+    run();
+route([FilePath]) ->
+    run(FilePath).
+
+%%%===================================================================
+%%% compose
+%%%===================================================================
+
+help() ->
+    Str =
+<<"""Commands:
+    <File> - read config from <File> (default: ./tmux_sessions)
+    test - run unit tests
+    help - output this message.
+    help config - output info about configuration.
+""">>,
+    io:format("~ts", [Str]).
+
+help_config() ->
+    Str =
+<<"""Script reads configuration file and builds tmux-sessions.
+Configuration - file with erlang-terms, separated by \".\". Reading done by file:consult/1.
+Example of 1 session:
+#{
+    type => session,
+    name => <<\"test\">>,
+    windows =>
+        [
+            #{
+                type => window,
+                name => <<\"htop\">>,
+                panes => [<<\"htop\">>, <<\"nvim\">>]
+            }
+        ]
+}.
+""">>,
+    io:format("~ts", [Str]).
+
+run() ->
+    FilePath =
+        unicode:characters_to_list([
+            filename:dirname(escript:script_name()), "/", "tmux_sessions"
+        ]),
+    run(FilePath, tmux_struct()).
+
+run(FilePath) ->
+    run(FilePath, tmux_struct()).
+
+-spec run(FilePath :: string(), Tmux :: tmux_struct()) ->
+    ok
+    | sessions_list_ret()
+    | init_sessions_ret().
+
+run(FilePath, Tmux) ->
+    pipe(
+        [
+            fun(X) -> flatmap(X, fun sessions_list/1) end,
+            % fun(X) -> flatmap(X, fun validate/1) end,
+            fun(X) -> flatmap(X, fun(SessionList) -> init_sessions(SessionList, Tmux) end) end,
+            fun process_ret/1
+        ],
+        right(FilePath)
+    ).
+
+% validate(SessionList) ->
+%     right(SessionList).
+
+%%--------------------------------------------------------------------
+%% Errors returned by init_sessions
+process_ret(Ret) when is_list(Ret) ->
+    pipe(
+        [
+            fun filter_errors/1,
+            fun process_errors/1
+        ],
+        Ret
+    );
+process_ret(Ret) ->
+    case is_left(Ret) of
+        true ->
+            {error, Reason} = extract(Ret),
+            io:format(
+                "Something happened with config. Reason: ~ts\n",
+                [file:format_error(Reason)]
+            ),
+            Ret;
+        false ->
+            io:format("ok\n", []),
+            ok
+    end.
+
+filter_errors(Ret) ->
+    lists:filter(
+        fun({_SessionName, Either}) -> is_left(Either) end,
+        Ret
+    ).
+
+process_errors([]) ->
+    io:format("ok\n", []);
+process_errors(Ret) ->
+    lists:foreach(
+        fun({SessionName, Either}) ->
+            {error, Reason} = extract(Either),
+            Str =
+                unicode:characters_to_binary([
+                    "Session:", " ", SessionName, "\n",
+                    "    ", io_lib:format("Reason: ~p", [Reason]), "\n"
+                ]),
+            io:format(standard_error, "~ts", [Str])
+        end,
+        Ret
+    ).
+%%--------------------------------------------------------------------
+
+%%%===================================================================
+%%% sessions
+%%%===================================================================
+
+-type session_list() :: [session()].
+
+-type init_sessions_ret() ::
+    [
+        {
+            SessionName :: unicode:unicode_binary(),
+            either({error, Reason :: init_session_reason()}, ok)
+        }
+    ].
+
+-spec init_sessions(SessionList :: session_list(), Tmux :: tmux_struct()) ->
+    init_sessions_ret().
+
+init_sessions(SessionList, Tmux) ->
+    lists:foldl(
+        fun(Session, Acc) ->
+           #{name := SessionName} = Session,
+           [{SessionName, init_session(Session, Tmux)} | Acc]
+        end,
+        [],
+        SessionList
+    ).
+
+-type init_session_reason() ::
+    ensure_new_session__reason()
+    | init_windows__reason()
+    | init_panes__reason().
+
+-type ensure_new_session__reason() ::
+    duplicate
+    | {new_session, output()}.
+
+-type init_windows__reason() ::
+    {new_window, output()}
+    | {rename_window, output()}
+    | {remove_window, output()}
+    | {renumber_windows, output()}.
+
+-type init_panes__reason() ::
+    {spawn_panes, output()}
+    | {send_cmds, output()}.
+
+%%--------------------------------------------------------------------
+-spec init_session(Session :: session(), Tmux :: tmux_struct()) ->
+    either({error, Reason :: init_session_reason()}, ok).
+%%--------------------------------------------------------------------
+init_session(Session, Tmux) ->
+    pipe(
+        [
+            fun(X) -> ensure_new_session_(X, Session, Tmux) end,
+            fun(X) -> init_windows_(X, Session, Tmux) end,
+            fun(X) -> init_panes_(X, Session, Tmux) end
+        ],
+        right(ok)
+    ).
+
+-spec ensure_new_session_(
+    Either :: either({error, _Reason}, ok),
+    Session :: session(),
+    Tmux :: tmux_struct()
+) ->
+    either({error, ensure_new_session__reason()}, ok).
+
+ensure_new_session_(Either, Session, Tmux) ->
+    pipe(
+        [
+            fun(X) -> has_session_(X, Session, Tmux) end,
+            fun(X) -> new_session_(X, Session, Tmux) end
+        ],
+        Either
+    ).
+
+has_session_(X, Session, Tmux) ->
+    flatmap(X, fun(ok) -> session_has_session(Session, Tmux) end).
+
+new_session_(X, Session, Tmux) ->
+    flatmap(
+        X,
+        fun(ok) ->
+            cata(
+                session_new_session(Session, Tmux),
+                fun({error, Output}) -> {error, {new_session, Output}} end,
+                fun(X2) -> X2 end
+            )
+        end
+    ).
+
+-spec init_windows_(
+    Either :: either({error, _Reason}, ok),
+    Session :: session(),
+    Tmux :: tmux_struct()
+) ->
+    either({error, init_windows__reason()}, ok).
+
+init_windows_(Either, Session, Tmux) ->
+    flatmap(Either, fun(ok) -> session_init_windows(Session, Tmux) end).
+
+-spec init_panes_(
+    Either :: either({error, _Reason}, ok),
+    Session :: session(),
+    Tmux :: tmux_struct()
+) ->
+    either({error, init_panes__reason()}, ok).
+
+init_panes_(Either, Session, Tmux) ->
+    flatmap(Either, fun(ok) -> session_init_panes(Session, Tmux) end).
+%%--------------------------------------------------------------------
+
+-type sessions_list_ret() ::
+    either(
+        session_list(),
+        {error, Reason :: sessions_list_reason()}
+    ).
+-type sessions_list_reason() :: file:posix() | badarg | terminated | system_limit.
+
+-spec sessions_list(Path :: string()) ->
+    sessions_list_ret().
+sessions_list(Path) ->
+    case file:consult(Path) of
+        {ok, SessionList} -> right(SessionList);
+        {error, Reason} -> left({error, Reason})
+    end.
+
+%%%===================================================================
+%%% session
+%%%===================================================================
+
+-type session() ::
+    #{
+        type := session,
+        name := unicode:unicode_binary(),
+        windows => [window()]
+    }.
+
+-type window() ::
+    #{
+        type := window,
+        name := unicode:unicode_binary(),
+        panes := [CMD :: unicode:unicode_binary()]
+    }.
+
+-spec session_has_session(
+    Session :: session(),
+    tmux_struct()
+) -> either({error, duplicate}, ok).
+
+session_has_session(Session, Tmux) ->
+    #{name := SessionName} = Session,
+    case tmux_has_session(SessionName, Tmux) of
+        {error, _Output} ->
+            right(ok);
+        {ok, _Output} ->
+            left({error, duplicate})
+    end.
+
+-spec session_new_session(
+    Session :: session(),
+    tmux_struct()
+) -> either({error, duplicate}, ok).
+
+session_new_session(Session, Tmux) ->
+    #{name := SessionName} = Session,
+    case tmux_new_session(SessionName, Tmux) of
+        {error, Output} -> left({error, Output});
+        {ok, _Output} -> right(ok)
+    end.
+
+%%--------------------------------------------------------------------
+-type init_windows_acc() :: #{
+    windows_counter := pos_integer(),
+    ret := ok | {error, Reason :: term()}
+}.
+
+session_init_windows(Session, Tmux) ->
+    pipe(
+        [
+            fun(X) -> spawn_windows_(X, Session, Tmux) end,
+            fun(X) -> remove_window_(X, Session, 0, Tmux) end,
+            fun(X) -> renumber_windows_(X, Session, Tmux) end,
+            fun extract/1,
+            fun(X) -> maps:get(ret, X) end,
+            fun either_from_val/1
+        ],
+        right(#{windows_counter => 1, ret => ok})
+    ).
+
+-spec spawn_windows_(X :: either(init_windows_acc()), Session :: session(), tmux_struct()) ->
+    either(init_windows_acc()).
+spawn_windows_(X, Session, Tmux) ->
+    #{windows := Windows} = Session,
+    lists:foldl(
+        fun(Window, X2) ->
+            pipe(
+                [
+                    fun(X3) -> new_window_(X3, Session, Tmux) end,
+                    fun(X3) -> rename_window_(X3, Session, Window, Tmux) end,
+                    fun update_counter/1
+                ],
+                X2
+            )
+        end,
+        X,
+        Windows
+    ).
+
+-spec new_window_(
+    X :: either(init_windows_acc()),
+    Session :: session(),
+    tmux_struct()
+) ->
+    either(init_windows_acc()).
+new_window_(X, Session, Tmux) ->
+    flatmap(
+        X,
+        fun(Acc) ->
+            #{windows_counter := WindowsCounter} = Acc,
+            cata(
+                session_new_window(Session, WindowsCounter, Tmux),
+                fun({error, Reason}) -> Acc#{ret => {error, {new_window, Reason}}} end,
+                fun(ok) -> Acc#{ret => ok} end
+            )
+        end
+    ).
+
+-spec rename_window_(
+    X :: either(init_windows_acc()),
+    Session :: session(),
+    Window :: window(),
+    tmux_struct()
+) ->
+    either(init_windows_acc()).
+
+rename_window_(X, Session, Window, Tmux) ->
+    flatmap(
+        X,
+        fun(Acc) ->
+            #{windows_counter := WindowsCounter} = Acc,
+            cata(
+                session_rename_window(Session, WindowsCounter, Window, Tmux),
+                fun({error, Reason}) ->
+                    Acc#{ret => {error, {rename_window, Reason}}}
+                end,
+                fun(ok) -> Acc#{ret => ok} end
+            )
+        end
+    ).
+
+-spec update_counter(X :: either(init_windows_acc())) ->
+    either(init_windows_acc()).
+
+update_counter(X) ->
+    map(X, fun(Acc) ->
+        maps:update_with(windows_counter, fun(X2) -> erlang:'+'(X2, 1) end, Acc)
+    end).
+
+remove_window_(X, Session, WindowIndex, Tmux) ->
+    flatmap(
+        X,
+        fun(Acc) ->
+            cata(
+                session_remove_window(Session, WindowIndex, Tmux),
+                fun({error, Reason}) ->
+                    Acc#{ret => {error, {remove_window, Reason}}}
+                end,
+                fun(ok) -> Acc#{ret => ok} end
+            )
+        end
+    ).
+
+renumber_windows_(X, Session, Tmux) ->
+    flatmap(
+        X,
+        fun(Acc) ->
+            cata(
+                session_renumber_windows(Session, Tmux),
+                fun({error, Reason}) ->
+                    Acc#{ret => {error, {renumber_windows, Reason}}}
+                end,
+                fun(ok) -> Acc#{ret => ok} end
+            )
+        end
+    ).
+%%--------------------------------------------------------------------
+
+%%--------------------------------------------------------------------
+session_init_panes(Session, Tmux) ->
+    pipe(
+        [
+            fun(X) -> spawn_panes_(X, Session, Tmux) end,
+            fun(X) -> send_cmds_(X, Session, Tmux) end
+        ],
+        right(ok)
+    ).
+
+spawn_panes_(X, Session, Tmux) ->
+    flatmap(
+        X,
+        fun(ok) ->
+            cata(
+                spawn_panes_(Session, Tmux),
+                fun({error, Reason}) -> {error, {spawn_panes, Reason}} end,
+                fun(ok) -> ok end
+            )
+        end
+    ).
+
+spawn_panes_(Session, Tmux) ->
+    #{windows := Windows, name := SessionName} = Session,
+    lists:foldl(
+        fun(Window, X2) ->
+            #{name := WindowName, panes := Panes} = Window,
+            {X4, _} =
+                lists:foldl(
+                    fun
+                        %% Skip pane 0, cause it's already created
+                        (_Pane, {X3, 0}) ->
+                            {X3, 1};
+                        (_Pane, {X3, Index}) ->
+                            {
+                                flatmap(
+                                    X3,
+                                    fun(ok) ->
+                                        case
+                                            tmux_split_window(
+                                                SessionName, WindowName, Tmux
+                                            )
+                                        of
+                                            {error, Reason} -> left({error, Reason});
+                                            {ok, _} -> right(ok)
+                                        end
+                                    end
+                                ),
+                                Index + 1
+                            }
+                    end,
+                    {X2, 0},
+                    Panes
+                ),
+            X4
+        end,
+        right(ok),
+        Windows
+    ).
+
+send_cmds_(X, Session, Tmux) ->
+    flatmap(
+        X,
+        fun(ok) ->
+            cata(
+                send_cmds_(Session, Tmux),
+                fun({error, Reason}) -> {error, {send_cmds, Reason}} end,
+                fun(ok) -> ok end
+            )
+        end
+    ).
+
+send_cmds_(Session, Tmux) ->
+    #{windows := Windows, name := SessionName} = Session,
+    lists:foldl(
+        fun(Window, X2) ->
+            #{name := WindowName, panes := Panes} = Window,
+            {X4, _} =
+                lists:foldl(
+                    fun(Pane, {X3, Index}) ->
+                        {
+                            flatmap(
+                                X3,
+                                fun(ok) ->
+                                    IndexStr = erlang:integer_to_binary(Index),
+                                    case
+                                        tmux_send_cmd(
+                                            SessionName,
+                                            WindowName,
+                                            Pane,
+                                            IndexStr,
+                                            Tmux
+                                        )
+                                    of
+                                        {error, Reason} -> left({error, Reason});
+                                        {ok, _} -> right(ok)
+                                    end
+                                end
+                            ),
+                            Index + 1
+                        }
+                    end,
+                    {X2, 0},
+                    Panes
+                ),
+            X4
+        end,
+        right(ok),
+        Windows
+    ).
+%%--------------------------------------------------------------------
+
+-spec session_new_window(
+    Session :: session(),
+    WindowsCounter :: non_neg_integer(),
+    tmux_struct()
+) -> either({error, output()}, ok).
+
+session_new_window(Session, WindowsCounter, Tmux) ->
+    #{name := SessionName} = Session,
+    case tmux_new_window(SessionName, erlang:integer_to_binary(WindowsCounter), Tmux) of
+        {error, Reason} -> left({error, Reason});
+        {ok, _} -> right(ok)
+    end.
+
+-spec session_rename_window(
+    Session :: session(),
+    WindowsCounter :: non_neg_integer(),
+    Window :: window(),
+    tmux_struct()
+) ->
+    either({error, output()}, ok).
+
+session_rename_window(Session, WindowsCounter, Window, Tmux) ->
+    #{name := SessionName} = Session,
+    WindowsCounterStr = erlang:integer_to_binary(WindowsCounter),
+    #{name := WindowNameNew} = Window,
+    case tmux_rename_window(SessionName, WindowsCounterStr, WindowNameNew, Tmux) of
+        {error, Reason} -> {error, Reason};
+        {ok, _} -> right(ok)
+    end.
+
+session_remove_window(Session, WindowIndex, Tmux) ->
+    #{name := SessionName} = Session,
+    WindowIndexStr = erlang:integer_to_binary(WindowIndex),
+    case tmux_remove_window(SessionName, WindowIndexStr, Tmux) of
+        {error, Reason} -> left({error, Reason});
+        {ok, _} -> right(ok)
+    end.
+
+session_renumber_windows(Session, Tmux) ->
+    #{name := SessionName} = Session,
+    case tmux_renumber_windows(SessionName, Tmux) of
+        {error, Reason} -> left({error, Reason});
+        {ok, _} -> right(ok)
+    end.
+
+%%%===================================================================
+%%% tmux
+%%%===================================================================
+
+-type tmux_struct() ::
+    #{
+        has_session := fun(
+            (SessionName :: unicode:unicode_binary()) ->
+            output()
+        ),
+        new_session := fun(
+            (SessionName :: unicode:unicode_binary()) ->
+            output()
+        ),
+        new_window := fun(
+            (
+                SessionName :: unicode:unicode_binary(),
+                WindowName :: unicode:unicode_binary()
+            ) -> output()
+        ),
+        rename_window := fun(
+            (
+                SessionName :: unicode:unicode_binary(),
+                WindowName :: unicode:unicode_binary(),
+                WindowNameNew :: unicode:unicode_binary()
+            ) -> output()
+        ),
+        remove_window := fun(
+            (
+                SessionName :: unicode:unicode_binary(),
+                WindowName :: unicode:unicode_binary()
+            ) -> output()
+        ),
+        renumber_windows := fun(
+            (SessionName :: unicode:unicode_binary()) ->
+            output()
+        ),
+        split_window := fun(
+            (
+                SessionName :: unicode:unicode_binary(),
+                WindowName :: unicode:unicode_binary()
+            ) -> output()
+        ),
+        send_cmd := fun(
+            (
+                SessionName :: unicode:unicode_binary(),
+                WindowName :: unicode:unicode_binary(),
+                CMD :: unicode:unicode_binary(),
+                Index :: unicode:unicode_binary()
+            ) -> output()
+        )
+    }.
+
+-spec tmux_struct() ->
+    tmux_struct().
+
+tmux_struct() ->
+    #{
+        has_session => fun tmux_has_session/1,
+        new_session => fun tmux_new_session/1,
+        new_window => fun tmux_new_window/2,
+        rename_window => fun tmux_rename_window/3,
+        remove_window => fun tmux_remove_window/2,
+        renumber_windows => fun tmux_renumber_windows/1,
+        split_window => fun tmux_split_window/2,
+        send_cmd => fun tmux_send_cmd/4
+    }.
+
+-spec tmux_has_session(
+    SessionName :: unicode:unicode_binary(),
+    tmux_struct()
+) ->
+    output().
+
+tmux_has_session(SessionName, Tmux) ->
+    F = maps:get(has_session, Tmux),
+    F(SessionName).
+
+tmux_has_session(SessionName) ->
+    CMD =
+        unicode:characters_to_list([
+            "tmux has-session -t=", SessionName
+        ]),
+    ?LOG_DEBUG(CMD),
+    run_cmd(CMD).
+
+-spec tmux_new_session(
+    SessionName :: unicode:unicode_binary(),
+    tmux_struct()
+) ->
+    output().
+
+tmux_new_session(SessionName, Tmux) ->
+    F = maps:get(new_session, Tmux),
+    F(SessionName).
+
+tmux_new_session(SessionName) ->
+    CMD =
+        unicode:characters_to_list([
+            "tmux new-session -ds", " ",
+            SessionName, " ",
+            "-c", " ",
+            os:getenv("HOME")
+        ]),
+    ?LOG_DEBUG(CMD),
+    run_cmd(CMD).
+
+-spec tmux_new_window(
+    SessionName :: unicode:unicode_binary(),
+    WindowName :: unicode:unicode_binary(),
+    tmux_struct()
+) ->
+    output().
+
+tmux_new_window(SessionName, WindowName, Tmux) ->
+    F = maps:get(new_window, Tmux),
+    F(SessionName, WindowName).
+
+tmux_new_window(SessionName, WindowName) ->
+    CMD =
+        unicode:characters_to_list([
+            "tmux new-window -t ",
+            unicode:characters_to_list([SessionName, ":", WindowName])
+        ]),
+    ?LOG_DEBUG(CMD),
+    run_cmd(CMD).
+
+-spec tmux_rename_window(
+    SessionName :: unicode:unicode_binary(),
+    WindowName :: unicode:unicode_binary(),
+    WindowNameNew :: unicode:unicode_binary(),
+    tmux_struct()
+) -> output().
+
+tmux_rename_window(SessionName, WindowNameOld, WindowNameNew, Tmux) ->
+    F = maps:get(rename_window, Tmux),
+    F(SessionName, WindowNameOld, WindowNameNew).
+
+tmux_rename_window(SessionName, WindowNameOld, WindowNameNew) ->
+    CMD =
+        unicode:characters_to_list([
+            "tmux rename-window -t ",
+            unicode:characters_to_list([SessionName, ":", WindowNameOld]),
+            " ",
+            WindowNameNew
+        ]),
+    ?LOG_DEBUG(CMD),
+    run_cmd(CMD).
+
+-spec tmux_remove_window(
+    SessionName :: unicode:unicode_binary(),
+    WindowName :: unicode:unicode_binary(),
+    tmux_struct()
+) ->
+    output().
+
+tmux_remove_window(SessionName, Window, Tmux) ->
+    F = maps:get(remove_window, Tmux),
+    F(SessionName, Window).
+
+tmux_remove_window(SessionName, Window) ->
+    CMD =
+        unicode:characters_to_list([
+            "tmux kill-window -t",
+            " ",
+            unicode:characters_to_list([SessionName, ":", Window])
+        ]),
+    ?LOG_DEBUG(CMD),
+    run_cmd(CMD).
+
+-spec tmux_renumber_windows(
+    SessionName :: unicode:unicode_binary(),
+    tmux_struct()
+) ->
+    output().
+
+tmux_renumber_windows(SessionName, Tmux) ->
+    F = maps:get(renumber_windows, Tmux),
+    F(SessionName).
+
+tmux_renumber_windows(SessionName) ->
+    CMD =
+        unicode:characters_to_list([
+            "tmux move-window -r -t", " ",
+            unicode:characters_to_list([SessionName, ":", "{start}"])
+        ]),
+    ?LOG_DEBUG(CMD),
+    run_cmd(CMD).
+
+-spec tmux_split_window(
+    SessionName :: unicode:unicode_binary(),
+    WindowName :: unicode:unicode_binary(),
+    tmux_struct()
+) ->
+    output().
+
+tmux_split_window(SessionName, WindowName, Tmux) ->
+    F = maps:get(split_window, Tmux),
+    F(SessionName, WindowName).
+
+tmux_split_window(SessionName, WindowName) ->
+    CMD =
+        unicode:characters_to_list([
+            "tmux split-window -t", " ",
+            unicode:characters_to_list([SessionName, ":", WindowName]), " ",
+            "-h"
+        ]),
+    ?LOG_DEBUG(CMD),
+    run_cmd(CMD).
+
+-spec tmux_send_cmd(
+    SessionName :: unicode:unicode_binary(),
+    WindowName :: unicode:unicode_binary(),
+    CMD :: unicode:unicode_binary(),
+    Index :: unicode:unicode_binary(),
+    tmux_struct()
+) ->
+    output().
+
+tmux_send_cmd(SessionName, WindowName, CMD, Index, Tmux) ->
+    F = maps:get(send_cmd, Tmux),
+    F(SessionName, WindowName, CMD, Index).
+
+tmux_send_cmd(SessionName, WindowName, CMD, Index) ->
+    CMD2 =
+        unicode:characters_to_list([
+            "tmux send-keys -t",
+            " ",
+            unicode:characters_to_list([SessionName, ":", WindowName, ".", Index]),
+            " ",
+            unicode:characters_to_list([CMD, " ", "C-m"])
+        ]),
+    ?LOG_DEBUG(CMD2),
+    run_cmd(CMD2).
+
+%%%===================================================================
+%%% either
+%%%===================================================================
+
+-type either(X) ::
+    either(X, X).
+
+-type either(L, R) ::
+    {left, L}
+    | {right, R}.
+
+either_from_val({ok, X}) -> right(X);
+either_from_val({error, Reason}) -> left({error, Reason});
+either_from_val(X) -> right(X).
+
+left(X) -> {left, X}.
+right(X) -> {right, X}.
+
+extract({left, X}) -> X;
+extract({right, X}) -> X.
+
+flatmap({left, X}, _F) -> {left, X};
+flatmap({right, X}, F) -> F(X).
+
+map({left, X}, _F) -> {left, X};
+map({right, X}, F) -> {right, F(X)}.
+
+cata({left, X}, LFun, _RFun) -> {left, LFun(X)};
+cata({right, X}, _LFun, RFun) -> {right, RFun(X)}.
+
+is_left({left, _}) -> true;
+is_left({right, _}) -> false.
+
+%%%===================================================================
+%%% compose
+%%%===================================================================
+
+pipe(Funs, Arg) -> lists:foldl(fun(F, Arg2) -> F(Arg2) end, Arg, Funs).
+
+%%%===================================================================
+%%% cmd
+%%%===================================================================
+
+-type output() :: [nonempty_string()].
+
+%%--------------------------------------------------------------------
+-spec run_cmd(CMD :: string()) ->
+    {ok | error, output()}.
+%%--------------------------------------------------------------------
+run_cmd(CMD) ->
+    P = erlang:open_port({spawn, CMD}, [exit_status, stderr_to_stdout]),
+    read_cmd_output_sync(P).
+%%--------------------------------------------------------------------
+
+%%--------------------------------------------------------------------
+-spec read_cmd_output_sync(P :: port()) ->
+    {ok | error, output()}.
+%%--------------------------------------------------------------------
+read_cmd_output_sync(P) ->
+    case wait_exit_status(P) of
+        {exit_status, 0} ->
+            {ok, read_cmd_output_sync2(P, [])};
+        {exit_status, _Status} ->
+            {error, read_cmd_output_sync2(P, [])}
+    end.
+%%--------------------------------------------------------------------
+
+%%--------------------------------------------------------------------
+-spec read_cmd_output_sync2(P :: port(), Acc :: [string()]) ->
+    Acc2 :: output().
+%%--------------------------------------------------------------------
+read_cmd_output_sync2(P, Acc) ->
+    receive
+        {P, {data, Str}} ->
+            read_cmd_output_sync2(P, [Str | Acc])
+    after 0 ->
+        lists:join(
+            "\n",
+            lists:map(
+                fun(Str) -> string:trim(Str, trailing, "\n") end,
+                lists:reverse(Acc)
+            )
+        )
+    end.
+%%--------------------------------------------------------------------
+
+%%--------------------------------------------------------------------
+-spec wait_exit_status(P :: port()) ->
+    {exit_status, integer()}.
+%%--------------------------------------------------------------------
+wait_exit_status(P) ->
+    receive
+        {P, Status = {exit_status, 0}} ->
+            Status;
+        {P, Status = {exit_status, _Code}} ->
+            Status
+    end.
+%%--------------------------------------------------------------------
+
+%%%===================================================================
+%%% test
+%%%===================================================================
+
+some_test() ->
+    Self = erlang:self(),
+    init_sessions(
+        [
+            #{
+                type => session,
+                name => <<"test">>,
+                windows =>
+                    [
+                        #{
+                            type => window,
+                            name => <<"btop">>,
+                            panes => [<<"btop">>, <<"nvim">>]
+                        }
+                    ]
+            }
+        ],
+        #{
+            has_session => fun(_SessionName) -> {error, "no session"} end,
+            new_session => fun(_SessionName) ->
+                Self ! new_session,
+                {ok, ""}
+            end,
+            new_window => fun(_SessionName, _WindowName) ->
+                Self ! new_window,
+                {ok, ""}
+            end,
+            rename_window => fun(_SessionName, _WindowNameOld, _WindowNameNew) ->
+                Self ! rename_window,
+                {ok, ""}
+            end,
+            remove_window => fun(_SessionName, _Window) ->
+                Self ! remove_window,
+                {ok, ""}
+            end,
+            renumber_windows => fun(_SessionName) ->
+                Self ! renumber_windows,
+                {ok, ""}
+            end,
+            split_window => fun(_SessionName, _WindowName) ->
+                Self ! split_window,
+                {ok, ""}
+            end,
+            send_cmd => fun(_SessionName, _WindowName, _CMD, _Index) ->
+                Self ! send_cmd,
+                {ok, ""}
+            end
+        }
+    ),
+    ?assertEqual(
+        [
+            new_session,
+            new_window,
+            rename_window,
+            remove_window,
+            renumber_windows,
+            split_window,
+            send_cmd,
+            send_cmd
+        ],
+        flush()
+    ).
+
+flush() ->
+    flush([]).
+
+flush(L) ->
+    receive
+        M -> flush([M | L])
+    after 0 -> lists:reverse(L)
+    end.
+
