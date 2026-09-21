@@ -525,7 +525,11 @@ send_cmds_(Session, Tmux) ->
             #{name := WindowName, panes := Panes} = Window,
             {X4, _} =
                 lists:foldl(
-                    fun(Pane, {X3, Index}) ->
+                    fun
+                    %% skip empty cmds
+                    (<<"">>, {X3, Index}) ->
+                        {X3, Index + 1};
+                    (Pane, {X3, Index}) ->
                         {
                             flatmap(
                                 X3,
