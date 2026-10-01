@@ -75,7 +75,7 @@ Example of 1 session:
             #{
                 type => window,
                 name => <<\"htop\">>,
-                panes => [<<\"htop\">>, <<\"nvim\">>]
+                panes => [<<\"htop\">>, <<"nvim -c ':normal ,ww'">>]
             }
         ]
 }.
@@ -526,31 +526,50 @@ send_cmds_(Session, Tmux) ->
             {X4, _} =
                 lists:foldl(
                     fun
-                    %% skip empty cmds
-                    (<<"">>, {X3, Index}) ->
-                        {X3, Index + 1};
-                    (Pane, {X3, Index}) ->
-                        {
-                            flatmap(
-                                X3,
-                                fun(ok) ->
-                                    IndexStr = erlang:integer_to_binary(Index),
-                                    case
-                                        tmux_send_cmd(
-                                            SessionName,
-                                            WindowName,
-                                            Pane,
-                                            IndexStr,
-                                            Tmux
-                                        )
-                                    of
-                                        {error, Reason} -> left({error, Reason});
-                                        {ok, _} -> right(ok)
+                        %% skip empty cmds
+                        (<<"">>, {X3, Index}) ->
+                            {X3, Index + 1};
+                        (Pane, {X3, Index}) ->
+                            {
+                                flatmap(
+                                    map(
+                                        X3, fun(ok) ->
+                                            case
+                                                string:find(Pane, <<" ">>) =/=
+                                                    nomatch
+                                                andalso
+                                                    string:equal(
+                                                        Pane,
+                                                        string:trim(Pane, both, "\"")
+                                                    )
+                                            of
+                                                true ->
+                                                    unicode:characters_to_binary([
+                                                        <<"\"">>, Pane, <<"\"">>
+                                                    ]);
+                                                false ->
+                                                    Pane
+                                            end
+                                        end
+                                    ),
+                                    fun(Pane2) ->
+                                        IndexStr = erlang:integer_to_binary(Index),
+                                        case
+                                            tmux_send_cmd(
+                                                SessionName,
+                                                WindowName,
+                                                Pane2,
+                                                IndexStr,
+                                                Tmux
+                                            )
+                                        of
+                                            {error, Reason} -> left({error, Reason});
+                                            {ok, _} -> right(ok)
+                                        end
                                     end
-                                end
-                            ),
-                            Index + 1
-                        }
+                                ),
+                                Index + 1
+                            }
                     end,
                     {X2, 0},
                     Panes
