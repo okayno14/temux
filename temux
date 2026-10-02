@@ -961,9 +961,12 @@ with_index(L) ->
 %%% test
 %%%===================================================================
 
-%% TODO add test for single pane window: no tmux split
 some_test() ->
-    Self = erlang:self(),
+    case_1(),
+    case_2(),
+    case_3().
+
+case_1() ->
     init_sessions(
         [
             #{
@@ -979,37 +982,7 @@ some_test() ->
                     ]
             }
         ],
-        #{
-            has_session => fun(_SessionName) -> {error, "no session"} end,
-            new_session => fun(_SessionName) ->
-                Self ! new_session,
-                {ok, ""}
-            end,
-            new_window => fun(_SessionName, _WindowName) ->
-                Self ! new_window,
-                {ok, ""}
-            end,
-            rename_window => fun(_SessionName, _WindowNameOld, _WindowNameNew) ->
-                Self ! rename_window,
-                {ok, ""}
-            end,
-            remove_window => fun(_SessionName, _Window) ->
-                Self ! remove_window,
-                {ok, ""}
-            end,
-            renumber_windows => fun(_SessionName) ->
-                Self ! renumber_windows,
-                {ok, ""}
-            end,
-            split_window => fun(_SessionName, _WindowName) ->
-                Self ! split_window,
-                {ok, ""}
-            end,
-            send_cmd => fun(_SessionName, _WindowName, _CMD, _Index) ->
-                Self ! send_cmd,
-                {ok, ""}
-            end
-        }
+        tmux_struct_fake()
     ),
     ?assertEqual(
         [
@@ -1024,6 +997,99 @@ some_test() ->
         ],
         flush()
     ).
+
+case_2() ->
+    init_sessions(
+        [
+            #{
+                type => session,
+                name => <<"test">>,
+                windows =>
+                    [
+                        #{
+                            type => window,
+                            name => <<"btop">>,
+                            panes => [<<"btop">>]
+                        }
+                    ]
+            }
+        ],
+        tmux_struct_fake()
+    ),
+    ?assertEqual(
+        [
+            new_session,
+            new_window,
+            rename_window,
+            remove_window,
+            renumber_windows,
+            send_cmd
+        ],
+        flush()
+    ).
+
+case_3() ->
+    init_sessions(
+        [
+            #{
+                type => session,
+                name => <<"test">>,
+                windows =>
+                    [
+                        #{
+                            type => window,
+                            name => <<"btop">>,
+                            panes => []
+                        }
+                    ]
+            }
+        ],
+        tmux_struct_fake()
+    ),
+    ?assertEqual(
+        [
+            new_session,
+            new_window,
+            rename_window,
+            remove_window,
+            renumber_windows
+        ],
+        flush()
+    ).
+
+tmux_struct_fake() ->
+    Self = erlang:self(),
+    #{
+        has_session => fun(_SessionName) -> {error, "no session"} end,
+        new_session => fun(_SessionName) ->
+            Self ! new_session,
+            {ok, ""}
+        end,
+        new_window => fun(_SessionName, _WindowName) ->
+            Self ! new_window,
+            {ok, ""}
+        end,
+        rename_window => fun(_SessionName, _WindowNameOld, _WindowNameNew) ->
+            Self ! rename_window,
+            {ok, ""}
+        end,
+        remove_window => fun(_SessionName, _Window) ->
+            Self ! remove_window,
+            {ok, ""}
+        end,
+        renumber_windows => fun(_SessionName) ->
+            Self ! renumber_windows,
+            {ok, ""}
+        end,
+        split_window => fun(_SessionName, _WindowName) ->
+            Self ! split_window,
+            {ok, ""}
+        end,
+        send_cmd => fun(_SessionName, _WindowName, _CMD, _Index) ->
+            Self ! send_cmd,
+            {ok, ""}
+        end
+    }.
 
 flush() ->
     flush([]).
