@@ -75,7 +75,7 @@ Example of 1 session:
             #{
                 type => window,
                 name => <<\"htop\">>,
-                panes => [<<\"htop\">>, <<"nvim -c ':normal ,ww'">>]
+                panes => [<<\"htop\">>, <<\"nvim -c ':normal ,ww'\">>]
             }
         ]
 }.
@@ -469,41 +469,25 @@ spawn_panes_(X, Session, Tmux) ->
     ).
 
 spawn_panes_(Session, Tmux) ->
-    #{windows := Windows, name := SessionName} = Session,
+    #{name := SessionName, windows := Windows} = Session,
+    %% Skip windows with single pane
+    %% Skip first pane in window, cause it's already existed
+    Panes = [{W, P} || W = #{panes := [_ | Panes2]} <- Windows, P <- Panes2, Panes2 =/= []],
     lists:foldl(
-        fun(Window, X2) ->
-            #{name := WindowName, panes := Panes} = Window,
-            {X4, _} =
-                lists:foldl(
-                    fun
-                        %% Skip pane 0, cause it's already created
-                        (_Pane, {X3, 0}) ->
-                            {X3, 1};
-                        (_Pane, {X3, Index}) ->
-                            {
-                                flatmap(
-                                    X3,
-                                    fun(ok) ->
-                                        case
-                                            tmux_split_window(
-                                                SessionName, WindowName, Tmux
-                                            )
-                                        of
-                                            {error, Reason} -> left({error, Reason});
-                                            {ok, _} -> right(ok)
-                                        end
-                                    end
-                                ),
-                                Index + 1
-                            }
-                    end,
-                    {X2, 0},
-                    Panes
-                ),
-            X4
+        fun({W, _P}, X2) ->
+            #{name := WindowName} = W,
+            flatmap(
+                X2,
+                fun(ok) ->
+                    case tmux_split_window(SessionName, WindowName, Tmux) of
+                        {error, Reason} -> left({error, Reason});
+                        {ok, _} -> right(ok)
+                    end
+                end
+            )
         end,
         right(ok),
-        Windows
+        Panes
     ).
 
 send_cmds_(X, Session, Tmux) ->
@@ -519,66 +503,60 @@ send_cmds_(X, Session, Tmux) ->
     ).
 
 send_cmds_(Session, Tmux) ->
-    #{windows := Windows, name := SessionName} = Session,
+    #{windows := Windows} = Session,
+    pipe(
+        [
+            fun(X) -> map(X, fun panes_maybe_wrapped_in_double_quotes/1) end,
+            fun(X) -> flatmap(X, fun(L) -> send_cmds__(L, Session, Tmux) end) end
+        ],
+        right([{W, P} || W = #{panes := Panes} <- Windows, P <- with_index(Panes)])
+    ).
+
+panes_maybe_wrapped_in_double_quotes(L) ->
+    lists:map(
+        fun({W, {Index, P}}) ->
+            P2 =
+                case
+                    string:find(P, <<" ">>) =/= nomatch andalso
+                        string:equal(P, string:trim(P, both, "\""))
+                of
+                    true ->
+                        unicode:characters_to_binary([<<"\"">>, P, <<"\"">>]);
+                    false ->
+                        P
+                end,
+            {W, {Index, P2}}
+        end,
+        L
+    ).
+
+send_cmds__(L, Session, Tmux) ->
     lists:foldl(
-        fun(Window, X2) ->
-            #{name := WindowName, panes := Panes} = Window,
-            {X4, _} =
-                lists:foldl(
-                    fun
-                        %% skip empty cmds
-                        (<<"">>, {X3, Index}) ->
-                            {X3, Index + 1};
-                        (Pane, {X3, Index}) ->
-                            {
-                                flatmap(
-                                    map(
-                                        X3, fun(ok) ->
-                                            case
-                                                string:find(Pane, <<" ">>) =/=
-                                                    nomatch
-                                                andalso
-                                                    string:equal(
-                                                        Pane,
-                                                        string:trim(Pane, both, "\"")
-                                                    )
-                                            of
-                                                true ->
-                                                    unicode:characters_to_binary([
-                                                        <<"\"">>, Pane, <<"\"">>
-                                                    ]);
-                                                false ->
-                                                    Pane
-                                            end
-                                        end
-                                    ),
-                                    fun(Pane2) ->
-                                        IndexStr = erlang:integer_to_binary(Index),
-                                        case
-                                            tmux_send_cmd(
-                                                SessionName,
-                                                WindowName,
-                                                Pane2,
-                                                IndexStr,
-                                                Tmux
-                                            )
-                                        of
-                                            {error, Reason} -> left({error, Reason});
-                                            {ok, _} -> right(ok)
-                                        end
-                                    end
-                                ),
-                                Index + 1
-                            }
-                    end,
-                    {X2, 0},
-                    Panes
-                ),
-            X4
+        fun
+            ({W, {Index, P}}, X) ->
+                #{name := WindowName} = W,
+                flatmap(
+                    X,
+                    fun(ok) ->
+                        session_send_cmd(Session, WindowName, P, Index, Tmux)
+                    end
+                )
         end,
         right(ok),
-        Windows
+        L
     ).
+%%--------------------------------------------------------------------
+
+%%--------------------------------------------------------------------
+session_send_cmd(_Session, _WindowName, <<"">>, _Index, _Tmux) ->
+    right(ok);
+session_send_cmd(Session, WindowName, Pane, Index, Tmux) ->
+    IndexStr = erlang:integer_to_binary(Index),
+    #{name := SessionName} = Session,
+    case tmux_send_cmd(SessionName, WindowName, Pane, IndexStr, Tmux) of
+        {error, Reason} -> left({error, Reason});
+        {ok, _} -> right(ok)
+    end.
 %%--------------------------------------------------------------------
 
 -spec session_new_window(
@@ -634,40 +612,44 @@ session_renumber_windows(Session, Tmux) ->
     #{
         has_session := fun(
             (SessionName :: unicode:unicode_binary()) ->
-            output()
+            {ok | error, output()}
         ),
         new_session := fun(
             (SessionName :: unicode:unicode_binary()) ->
-            output()
+            {ok | error, output()}
         ),
         new_window := fun(
             (
                 SessionName :: unicode:unicode_binary(),
                 WindowName :: unicode:unicode_binary()
-            ) -> output()
+            ) ->
+            {ok | error, output()}
         ),
         rename_window := fun(
             (
                 SessionName :: unicode:unicode_binary(),
                 WindowName :: unicode:unicode_binary(),
                 WindowNameNew :: unicode:unicode_binary()
-            ) -> output()
+            ) ->
+            {ok | error, output()}
         ),
         remove_window := fun(
             (
                 SessionName :: unicode:unicode_binary(),
                 WindowName :: unicode:unicode_binary()
-            ) -> output()
+            ) ->
+            {ok | error, output()}
         ),
         renumber_windows := fun(
             (SessionName :: unicode:unicode_binary()) ->
-            output()
+            {ok | error, output()}
         ),
         split_window := fun(
             (
                 SessionName :: unicode:unicode_binary(),
                 WindowName :: unicode:unicode_binary()
-            ) -> output()
+            ) ->
+            {ok | error, output()}
         ),
         send_cmd := fun(
             (
@@ -675,7 +657,8 @@ session_renumber_windows(Session, Tmux) ->
                 WindowName :: unicode:unicode_binary(),
                 CMD :: unicode:unicode_binary(),
                 Index :: unicode:unicode_binary()
-            ) -> output()
+            ) ->
+            {ok | error, output()}
         )
     }.
 
@@ -698,7 +681,7 @@ tmux_struct() ->
     SessionName :: unicode:unicode_binary(),
     tmux_struct()
 ) ->
-    output().
+    {ok | error, output()}.
 
 tmux_has_session(SessionName, Tmux) ->
     F = maps:get(has_session, Tmux),
@@ -716,7 +699,7 @@ tmux_has_session(SessionName) ->
     SessionName :: unicode:unicode_binary(),
     tmux_struct()
 ) ->
-    output().
+    {ok | error, output()}.
 
 tmux_new_session(SessionName, Tmux) ->
     F = maps:get(new_session, Tmux),
@@ -738,7 +721,7 @@ tmux_new_session(SessionName) ->
     WindowName :: unicode:unicode_binary(),
     tmux_struct()
 ) ->
-    output().
+    {ok | error, output()}.
 
 tmux_new_window(SessionName, WindowName, Tmux) ->
     F = maps:get(new_window, Tmux),
@@ -758,7 +741,8 @@ tmux_new_window(SessionName, WindowName) ->
     WindowName :: unicode:unicode_binary(),
     WindowNameNew :: unicode:unicode_binary(),
     tmux_struct()
-) -> output().
+) ->
+    {ok | error, output()}.
 
 tmux_rename_window(SessionName, WindowNameOld, WindowNameNew, Tmux) ->
     F = maps:get(rename_window, Tmux),
@@ -780,7 +764,7 @@ tmux_rename_window(SessionName, WindowNameOld, WindowNameNew) ->
     WindowName :: unicode:unicode_binary(),
     tmux_struct()
 ) ->
-    output().
+    {ok | error, output()}.
 
 tmux_remove_window(SessionName, Window, Tmux) ->
     F = maps:get(remove_window, Tmux),
@@ -800,7 +784,7 @@ tmux_remove_window(SessionName, Window) ->
     SessionName :: unicode:unicode_binary(),
     tmux_struct()
 ) ->
-    output().
+    {ok | error, output()}.
 
 tmux_renumber_windows(SessionName, Tmux) ->
     F = maps:get(renumber_windows, Tmux),
@@ -820,7 +804,7 @@ tmux_renumber_windows(SessionName) ->
     WindowName :: unicode:unicode_binary(),
     tmux_struct()
 ) ->
-    output().
+    {ok | error, output()}.
 
 tmux_split_window(SessionName, WindowName, Tmux) ->
     F = maps:get(split_window, Tmux),
@@ -843,7 +827,7 @@ tmux_split_window(SessionName, WindowName) ->
     Index :: unicode:unicode_binary(),
     tmux_struct()
 ) ->
-    output().
+    {ok | error, output()}.
 
 tmux_send_cmd(SessionName, WindowName, CMD, Index, Tmux) ->
     F = maps:get(send_cmd, Tmux),
@@ -961,9 +945,23 @@ wait_exit_status(P) ->
 %%--------------------------------------------------------------------
 
 %%%===================================================================
+%%% lists
+%%%===================================================================
+
+with_index(L) ->
+    {_, L2} =
+        lists:foldl(
+            fun(X, {Index, Acc}) -> {Index + 1, [{Index, X} | Acc]} end,
+            {0, []},
+            L
+        ),
+    lists:reverse(L2).
+
+%%%===================================================================
 %%% test
 %%%===================================================================
 
+%% TODO add test for single pane window: no tmux split
 some_test() ->
     Self = erlang:self(),
     init_sessions(
