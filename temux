@@ -448,33 +448,34 @@ renumber_windows_(X, Session, Tmux) ->
 
 %%--------------------------------------------------------------------
 session_init_panes(Session, Tmux) ->
+    #{windows := Windows} = Session,
     pipe(
         [
             fun(X) -> spawn_panes_(X, Session, Tmux) end,
             fun(X) -> send_cmds_(X, Session, Tmux) end
         ],
-        right(ok)
+        right([{W, P} || W = #{panes := Panes} <- Windows, P <- with_index(Panes)])
     ).
 
 spawn_panes_(X, Session, Tmux) ->
     flatmap(
         X,
-        fun(ok) ->
+        fun(L) ->
             cata(
-                spawn_panes_(Session, Tmux),
+                spawn_panes__(Session, L, Tmux),
                 fun({error, Reason}) -> {error, {spawn_panes, Reason}} end,
-                fun(ok) -> ok end
+                fun(_) -> L end
             )
         end
     ).
 
-spawn_panes_(Session, Tmux) ->
-    #{name := SessionName, windows := Windows} = Session,
+spawn_panes__(Session, L, Tmux) ->
+    #{name := SessionName} = Session,
     %% Skip windows with single pane
     %% Skip first pane in window, cause it's already existed
-    Panes = [{W, P} || W = #{panes := [_ | Panes2]} <- Windows, P <- Panes2, Panes2 =/= []],
+    L2 = [{W, {Index, P}} || {W, {Index, P}} <- L, Index > 0],
     lists:foldl(
-        fun({W, _P}, X2) ->
+        fun({W, {_Index, _P}}, X2) ->
             #{name := WindowName} = W,
             flatmap(
                 X2,
@@ -487,29 +488,28 @@ spawn_panes_(Session, Tmux) ->
             )
         end,
         right(ok),
-        Panes
+        L2
     ).
 
 send_cmds_(X, Session, Tmux) ->
     flatmap(
         X,
-        fun(ok) ->
+        fun(L) ->
             cata(
-                send_cmds_(Session, Tmux),
+                send_cmds__(Session, L, Tmux),
                 fun({error, Reason}) -> {error, {send_cmds, Reason}} end,
                 fun(ok) -> ok end
             )
         end
     ).
 
-send_cmds_(Session, Tmux) ->
-    #{windows := Windows} = Session,
+send_cmds__(Session, L, Tmux) ->
     pipe(
         [
             fun(X) -> map(X, fun panes_maybe_wrapped_in_double_quotes/1) end,
-            fun(X) -> flatmap(X, fun(L) -> send_cmds__(L, Session, Tmux) end) end
+            fun(X) -> flatmap(X, fun(L2) -> send_cmds___(Session, L2, Tmux) end) end
         ],
-        right([{W, P} || W = #{panes := Panes} <- Windows, P <- with_index(Panes)])
+        right(L)
     ).
 
 panes_maybe_wrapped_in_double_quotes(L) ->
@@ -530,7 +530,7 @@ panes_maybe_wrapped_in_double_quotes(L) ->
         L
     ).
 
-send_cmds__(L, Session, Tmux) ->
+send_cmds___(Session, L, Tmux) ->
     lists:foldl(
         fun
             ({W, {Index, P}}, X) ->
