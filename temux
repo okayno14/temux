@@ -949,13 +949,7 @@ wait_exit_status(P) ->
 %%%===================================================================
 
 with_index(L) ->
-    {_, L2} =
-        lists:foldl(
-            fun(X, {Index, Acc}) -> {Index + 1, [{Index, X} | Acc]} end,
-            {0, []},
-            L
-        ),
-    lists:reverse(L2).
+    lists:zip(lists:seq(0, erlang:length(L) - 1), L).
 
 %%%===================================================================
 %%% test
